@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     T1526 - Cloud Service Discovery - Red Team TTP Demo (Deep Enumeration + Excel/CSV Report)
 .DESCRIPTION
@@ -2489,32 +2489,36 @@ function Build-MITREThreatMap {
 }
 
 # -----------------------------------------------------------------------------
-# New-MITREThreatMapGraphImage
+# Add-MITREThreatMapGraphSheet
 #
-# Generates a MITRE ATT&CK Navigator-style heatmap PNG from the MITREThreatMap
-# rows. One column per Tactic, one colored cell per technique mapped into that
-# tactic. Cell color = severity; cell text = MitreId + technique name + live
-# counts. Produces a PNG the caller can embed in an Excel worksheet.
+# Builds the "MITRE Threat Map Graph" worksheet using NATIVE Excel cells (no
+# embedded image). One column per ATT&CK Tactic in kill-chain order, one cell
+# per technique mapped into that tactic. Cell fill = severity; cell text =
+# MitreId + Technique name + Count / HighValue. Because this is real cell
+# data, every column width and every row height is user-adjustable in Excel,
+# the text is selectable / copyable, and the sheet can be filtered or further
+# annotated by the reviewer after the report is delivered.
 #
-# Uses System.Drawing which ships with Windows PowerShell 5.1 natively. On PS7
-# on Windows it still works because System.Drawing.Common is available out of
-# the box on Windows hosts. Function throws on failure so the caller can fall
-# back cleanly.
+# Replaces the prior PNG-rendering implementation. The data source is still
+# $Report.MITREThreatMap so all upstream code (Build-MITREThreatMap, the
+# Executive Summary references, the MITREThreatMap data tab) is unchanged.
 # -----------------------------------------------------------------------------
-function New-MITREThreatMapGraphImage {
-    param(
-        [Parameter(Mandatory=$true)][string]$OutputImagePath
-    )
-
-    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+function Add-MITREThreatMapGraphSheet {
+    param([Parameter(Mandatory=$true)]$Pkg)
 
     if ($Report.MITREThreatMap.Count -eq 0) {
         throw "MITREThreatMap is empty - nothing to render."
     }
 
-    # Group techniques by tactic in a sensible attack-lifecycle order (rather
-    # than alphabetical) so the image reads left-to-right like an attacker
-    # would move through a kill chain.
+    # Idempotent reruns: drop any pre-existing copy of this sheet so a re-open
+    # of the workbook produces a clean rebuild rather than appending.
+    $existing = $Pkg.Workbook.Worksheets | Where-Object { $_.Name -eq 'MITRE Threat Map Graph' }
+    if ($existing) { $Pkg.Workbook.Worksheets.Delete('MITRE Threat Map Graph') }
+
+    $ws = $Pkg.Workbook.Worksheets.Add('MITRE Threat Map Graph')
+    $ws.View.ShowGridLines = $false
+
+    # -------- Tactic ordering (kill-chain order, not alphabetical) -----------
     $tacticOrder = @(
         'Reconnaissance','Resource Development','Initial Access','Execution',
         'Persistence','Privilege Escalation','Defense Evasion','Credential Access',
@@ -2527,85 +2531,118 @@ function New-MITREThreatMapGraphImage {
         $grp = $byTactic | Where-Object { $_.Name -eq $t }
         if ($grp) { $orderedTactics += $grp }
     }
-    # Any tactic we didn't list in $tacticOrder gets appended at the end so
-    # future additions aren't silently dropped from the graphic.
+    # Any tactic we didn't list above gets appended so future additions aren't
+    # silently dropped from the sheet.
     foreach ($g in $byTactic) {
         if ($orderedTactics -notcontains $g) { $orderedTactics += $g }
     }
 
-    # Layout constants (tuned for a ~2000x1100 image that prints legibly at
-    # full width on a 16:9 slide).
-    $colWidth      = 230
-    $cellHeight    = 72
-    $headerHeight  = 54
-    $titleHeight   = 90
-    $legendHeight  = 46
-    $margin        = 24
-    $colGap        = 10
+    $colCount = $orderedTactics.Count
+    if ($colCount -lt 1) { return }
 
-    $maxRowsInCol = 0
-    foreach ($t in $orderedTactics) {
-        if ($t.Count -gt $maxRowsInCol) { $maxRowsInCol = $t.Count }
+    # -------- Palette ---------------------------------------------------------
+    $navy        = [System.Drawing.Color]::FromArgb(30, 45, 90)
+    $darkText    = [System.Drawing.Color]::FromArgb(24, 32, 60)
+    $bandBg      = [System.Drawing.Color]::FromArgb(245, 246, 249)
+    $white       = [System.Drawing.Color]::White
+    $black       = [System.Drawing.Color]::Black
+    $borderGray  = [System.Drawing.Color]::FromArgb(70, 70, 90)
+
+    $sevColor = @{
+        'Critical' = [System.Drawing.Color]::FromArgb(198, 40, 40)
+        'High'     = [System.Drawing.Color]::FromArgb(244, 110, 40)
+        'Medium'   = [System.Drawing.Color]::FromArgb(240, 196, 64)
+        'Low'      = [System.Drawing.Color]::FromArgb(120, 180, 90)
+        'Info'     = [System.Drawing.Color]::FromArgb(150, 160, 175)
     }
-    if ($maxRowsInCol -lt 1) { $maxRowsInCol = 1 }
+    $defaultSev = [System.Drawing.Color]::FromArgb(200, 200, 210)
 
-    $imgWidth  = ($orderedTactics.Count * $colWidth) + (2 * $margin)
-    $imgHeight = $titleHeight + $headerHeight + ($maxRowsInCol * $cellHeight) + $legendHeight + (2 * $margin)
+    # -------- Layout constants -----------------------------------------------
+    # Column A is left as a thin margin; the grid starts at column B.
+    $titleRow      = 1
+    $subtitleRow   = 2
+    $headerRow     = 4
+    $firstDataRow  = 5
+    $startCol      = 2
+    $endCol        = $startCol + $colCount - 1
 
-    # Surface and graphics context
-    $bmp = New-Object System.Drawing.Bitmap $imgWidth, $imgHeight
-    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-    $gfx.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $gfx.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
-    $gfx.Clear([System.Drawing.Color]::FromArgb(245, 246, 249))
-
-    # Fonts
-    $titleFont    = New-Object System.Drawing.Font 'Segoe UI', 22, ([System.Drawing.FontStyle]::Bold)
-    $subtitleFont = New-Object System.Drawing.Font 'Segoe UI', 10, ([System.Drawing.FontStyle]::Italic)
-    $headerFont   = New-Object System.Drawing.Font 'Segoe UI', 11, ([System.Drawing.FontStyle]::Bold)
-    $idFont       = New-Object System.Drawing.Font 'Consolas', 9,  ([System.Drawing.FontStyle]::Bold)
-    $techFont     = New-Object System.Drawing.Font 'Segoe UI', 9,  ([System.Drawing.FontStyle]::Bold)
-    $countFont    = New-Object System.Drawing.Font 'Segoe UI', 8
-    $legendFont   = New-Object System.Drawing.Font 'Segoe UI', 9,  ([System.Drawing.FontStyle]::Bold)
-
-    $darkBrush  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(24, 32, 60))
-    $whiteBrush = [System.Drawing.Brushes]::White
-    $blackBrush = [System.Drawing.Brushes]::Black
-    $gridPen    = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(70, 70, 90)), 1
-
-    # Severity -> color helper
-    $severityColor = {
-        param($sev)
-        switch ($sev) {
-            'Critical' { [System.Drawing.Color]::FromArgb(198, 40, 40) }   # deep red
-            'High'     { [System.Drawing.Color]::FromArgb(244, 110, 40) }  # orange
-            'Medium'   { [System.Drawing.Color]::FromArgb(240, 196, 64) }  # gold
-            'Low'      { [System.Drawing.Color]::FromArgb(120, 180, 90) }  # green
-            'Info'     { [System.Drawing.Color]::FromArgb(150, 160, 175) } # gray
-            default    { [System.Drawing.Color]::FromArgb(200, 200, 210) }
+    # Helper: 1-indexed column number -> letter (A, B, ..., Z, AA, AB, ...)
+    function Convert-ToColLetter([int]$n) {
+        $s = ''
+        while ($n -gt 0) {
+            $r = ($n - 1) % 26
+            $s = [char](65 + $r) + $s
+            $n = [int][math]::Floor(($n - 1) / 26)
         }
+        return $s
     }
+    $startColLetter = Convert-ToColLetter $startCol
+    $endColLetter   = Convert-ToColLetter $endCol
 
-    # --- Title block ---------------------------------------------------------
-    $gfx.DrawString("MITRE ATT&CK - Azure / Entra ID T1526 Enumeration Coverage",
-        $titleFont, $darkBrush, [single]$margin, [single]$margin)
-    $subtitle = "Tenant: $ResolvedTenant   /   Run: $Timestamp   /   Cells colored by severity; text = MitreId + Technique + Count / HighValue"
-    $gfx.DrawString($subtitle, $subtitleFont, $darkBrush, [single]$margin, [single]($margin + 44))
+    # -------- Title banner ---------------------------------------------------
+    $titleRange = "${startColLetter}${titleRow}:${endColLetter}${titleRow}"
+    $ws.Cells[$titleRange].Merge = $true
+    $ws.Cells["${startColLetter}${titleRow}"].Value = "MITRE ATT&CK - Azure / Entra ID T1526 Enumeration Coverage"
+    $ws.Cells["${startColLetter}${titleRow}"].Style.Font.Size  = 18
+    $ws.Cells["${startColLetter}${titleRow}"].Style.Font.Bold  = $true
+    $ws.Cells["${startColLetter}${titleRow}"].Style.Font.Color.SetColor($white)
+    $ws.Cells["${startColLetter}${titleRow}"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+    $ws.Cells["${startColLetter}${titleRow}"].Style.Fill.BackgroundColor.SetColor($navy)
+    $ws.Cells["${startColLetter}${titleRow}"].Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Center
+    $ws.Cells["${startColLetter}${titleRow}"].Style.VerticalAlignment   = [OfficeOpenXml.Style.ExcelVerticalAlignment]::Center
+    $ws.Row($titleRow).Height = 32
 
-    # --- Columns -------------------------------------------------------------
-    $x  = $margin
-    $y0 = $margin + $titleHeight
-    foreach ($t in $orderedTactics) {
-        # Tactic header band
-        $headerRect = New-Object System.Drawing.Rectangle $x, $y0, ($colWidth - $colGap), $headerHeight
-        $gfx.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(30, 45, 90))), $headerRect)
-        $sf = New-Object System.Drawing.StringFormat
-        $sf.Alignment     = [System.Drawing.StringAlignment]::Center
-        $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-        $gfx.DrawString($t.Name, $headerFont, $whiteBrush, ([System.Drawing.RectangleF]$headerRect), $sf)
+    # -------- Subtitle -------------------------------------------------------
+    $subRange = "${startColLetter}${subtitleRow}:${endColLetter}${subtitleRow}"
+    $ws.Cells[$subRange].Merge = $true
+    $ws.Cells["${startColLetter}${subtitleRow}"].Value =
+        "Tenant: $ResolvedTenant   /   Run: $Timestamp   /   Cells colored by severity; text = MitreId + Technique + Count / HighValue"
+    $ws.Cells["${startColLetter}${subtitleRow}"].Style.Font.Italic = $true
+    $ws.Cells["${startColLetter}${subtitleRow}"].Style.Font.Size = 10
+    $ws.Cells["${startColLetter}${subtitleRow}"].Style.Font.Color.SetColor($darkText)
+    $ws.Cells["${startColLetter}${subtitleRow}"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+    $ws.Cells["${startColLetter}${subtitleRow}"].Style.Fill.BackgroundColor.SetColor($bandBg)
+    $ws.Cells["${startColLetter}${subtitleRow}"].Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Center
+    $ws.Row($subtitleRow).Height = 22
+
+    # -------- Tactic header row (one cell per tactic) ------------------------
+    $ws.Column(1).Width = 2          # left margin column
+    for ($i = 0; $i -lt $colCount; $i++) {
+        $col       = $startCol + $i
+        $colLetter = Convert-ToColLetter $col
+        $cell      = $ws.Cells["${colLetter}${headerRow}"]
+        $cell.Value = $orderedTactics[$i].Name
+        $cell.Style.Font.Bold  = $true
+        $cell.Style.Font.Size  = 11
+        $cell.Style.Font.Color.SetColor($white)
+        $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+        $cell.Style.Fill.BackgroundColor.SetColor($navy)
+        $cell.Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Center
+        $cell.Style.VerticalAlignment   = [OfficeOpenXml.Style.ExcelVerticalAlignment]::Center
+        $cell.Style.WrapText = $true
+        $cell.Style.Border.Top.Style    = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $cell.Style.Border.Bottom.Style = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $cell.Style.Border.Left.Style   = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $cell.Style.Border.Right.Style  = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $cell.Style.Border.Top.Color.SetColor($borderGray)
+        $cell.Style.Border.Bottom.Color.SetColor($borderGray)
+        $cell.Style.Border.Left.Color.SetColor($borderGray)
+        $cell.Style.Border.Right.Color.SetColor($borderGray)
+
+        # Initial column width - user can drag to adjust in Excel.
+        $ws.Column($col).Width = 32
+    }
+    $ws.Row($headerRow).Height = 28
+
+    # -------- Technique cells (one cell per technique, one column per tactic)
+    # Track the deepest column so we know where to put the legend underneath.
+    $maxRowsInCol = 0
+    for ($i = 0; $i -lt $colCount; $i++) {
+        $col       = $startCol + $i
+        $colLetter = Convert-ToColLetter $col
 
         # Sort techniques in the column by severity so Critical items float up
-        $techs = $t.Group | Sort-Object @{Expression = {
+        $techs = $orderedTactics[$i].Group | Sort-Object @{Expression = {
             switch ($_.Severity) {
                 'Critical' { 0 }
                 'High'     { 1 }
@@ -2616,64 +2653,107 @@ function New-MITREThreatMapGraphImage {
             }
         }}, MitreId
 
-        $cy = $y0 + $headerHeight + 4
+        $r = $firstDataRow
         foreach ($tech in $techs) {
-            $cellRect = New-Object System.Drawing.Rectangle $x, $cy, ($colWidth - $colGap), ($cellHeight - 4)
-            $cellColor = & $severityColor $tech.Severity
-            $gfx.FillRectangle((New-Object System.Drawing.SolidBrush $cellColor), $cellRect)
-            $gfx.DrawRectangle($gridPen, $cellRect)
+            $cell = $ws.Cells["${colLetter}${r}"]
 
-            # Pick readable text color based on the fill's luminance
-            $luma = ($cellColor.R * 0.299) + ($cellColor.G * 0.587) + ($cellColor.B * 0.114)
-            $textBrush = if ($luma -lt 145) { $whiteBrush } else { $blackBrush }
+            # Cell text: three lines so the visual block matches the original
+            # PNG layout (ID at top, technique name middle, counts at bottom).
+            $cell.Value = "$($tech.MitreId)`r`n$($tech.MitreTechnique)`r`nCount: $($tech.Count)   HV: $($tech.HighValueCount)"
+            $cell.Style.WrapText            = $true
+            $cell.Style.VerticalAlignment   = [OfficeOpenXml.Style.ExcelVerticalAlignment]::Top
+            $cell.Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Left
+            $cell.Style.Font.Bold           = $true
+            $cell.Style.Font.Size           = 9
+            $cell.Style.Font.Name           = 'Segoe UI'
 
-            # MitreId (top-left, monospace for that "tech" look)
-            $gfx.DrawString(
-                $tech.MitreId,
-                $idFont, $textBrush,
-                [single]($x + 8), [single]($cy + 6))
+            # Severity fill
+            $color = if ($sevColor.ContainsKey($tech.Severity)) { $sevColor[$tech.Severity] } else { $defaultSev }
+            $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $cell.Style.Fill.BackgroundColor.SetColor($color)
 
-            # Technique name (wrapped, middle)
-            $nameRect = New-Object System.Drawing.RectangleF `
-                ([single]($x + 8)), ([single]($cy + 22)), `
-                ([single]($colWidth - $colGap - 16)), ([single]($cellHeight - 46))
-            $techName = $tech.MitreTechnique
-            if ($techName.Length -gt 70) { $techName = $techName.Substring(0, 67) + '...' }
-            $gfx.DrawString($techName, $techFont, $textBrush, $nameRect)
+            # Pick readable text color based on the fill's luminance, same
+            # rule the original PNG used.
+            $luma = ($color.R * 0.299) + ($color.G * 0.587) + ($color.B * 0.114)
+            $textColor = if ($luma -lt 145) { $white } else { $black }
+            $cell.Style.Font.Color.SetColor($textColor)
 
-            # Count / HighValue footer (bottom)
-            $countText = "Count: $($tech.Count)   HV: $($tech.HighValueCount)"
-            $gfx.DrawString(
-                $countText,
-                $countFont, $textBrush,
-                [single]($x + 8), [single]($cy + $cellHeight - 20))
+            # Cell border
+            $cell.Style.Border.Top.Style    = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+            $cell.Style.Border.Bottom.Style = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+            $cell.Style.Border.Left.Style   = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+            $cell.Style.Border.Right.Style  = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+            $cell.Style.Border.Top.Color.SetColor($borderGray)
+            $cell.Style.Border.Bottom.Color.SetColor($borderGray)
+            $cell.Style.Border.Left.Color.SetColor($borderGray)
+            $cell.Style.Border.Right.Color.SetColor($borderGray)
 
-            $cy += $cellHeight
+            # Hover tooltip with the full attacker use-case + suggested
+            # detection so reviewers don't have to leave this tab to get
+            # context. (Excel comment, not data, so it doesn't affect cells.)
+            try {
+                $tip = "Category: $($tech.Category)`r`n" +
+                       "Source sheet: $($tech.SourceWorksheet)`r`n" +
+                       "Severity: $($tech.Severity)`r`n`r`n" +
+                       "Attacker use case:`r`n$($tech.AttackerUseCase)`r`n`r`n" +
+                       "Suggested detection:`r`n$($tech.SuggestedDetection)`r`n`r`n" +
+                       "Reference: $($tech.ReferenceURL)"
+                $null = $cell.AddComment($tip, 'T1526 Report')
+            } catch { }
+
+            # Initial row height tuned for 3 wrapped lines at 9pt; user can
+            # drag the row divider in Excel to shrink/grow as desired.
+            $ws.Row($r).Height = 60
+
+            $r++
         }
 
-        $x += $colWidth
+        $rowsThisCol = $r - $firstDataRow
+        if ($rowsThisCol -gt $maxRowsInCol) { $maxRowsInCol = $rowsThisCol }
     }
+    if ($maxRowsInCol -lt 1) { $maxRowsInCol = 1 }
 
-    # --- Legend --------------------------------------------------------------
-    $legendY = $imgHeight - $legendHeight - $margin + 12
-    $lx = $margin
-    $gfx.DrawString("Severity legend:", $legendFont, $darkBrush, [single]$lx, [single]$legendY)
-    $lx += 130
+    # -------- Severity legend (placed below the deepest tactic column) -------
+    $legendRow = $firstDataRow + $maxRowsInCol + 1
+    $ws.Row($legendRow).Height = 22
+
+    $legendLabelCell = $ws.Cells["${startColLetter}${legendRow}"]
+    $legendLabelCell.Value = "Severity legend:"
+    $legendLabelCell.Style.Font.Bold = $true
+    $legendLabelCell.Style.Font.Size = 10
+    $legendLabelCell.Style.Font.Color.SetColor($darkText)
+    $legendLabelCell.Style.VerticalAlignment   = [OfficeOpenXml.Style.ExcelVerticalAlignment]::Center
+    $legendLabelCell.Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Right
+
+    $legendCol = $startCol + 1
     foreach ($sev in @('Critical','High','Medium','Low','Info')) {
-        $chip = New-Object System.Drawing.Rectangle $lx, ($legendY + 1), 22, 16
-        $gfx.FillRectangle((New-Object System.Drawing.SolidBrush (& $severityColor $sev)), $chip)
-        $gfx.DrawRectangle([System.Drawing.Pens]::Black, $chip)
-        $gfx.DrawString($sev, $legendFont, $darkBrush, [single]($lx + 28), [single]$legendY)
-        $lx += 110
+        if ($legendCol -gt $endCol) { break }
+        $clr = $sevColor[$sev]
+        $legendLetter = Convert-ToColLetter $legendCol
+        $cell = $ws.Cells["${legendLetter}${legendRow}"]
+        $cell.Value = $sev
+        $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+        $cell.Style.Fill.BackgroundColor.SetColor($clr)
+        $luma = ($clr.R * 0.299) + ($clr.G * 0.587) + ($clr.B * 0.114)
+        $tcol = if ($luma -lt 145) { $white } else { $black }
+        $cell.Style.Font.Color.SetColor($tcol)
+        $cell.Style.Font.Bold = $true
+        $cell.Style.Font.Size = 10
+        $cell.Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Center
+        $cell.Style.VerticalAlignment   = [OfficeOpenXml.Style.ExcelVerticalAlignment]::Center
+        $cell.Style.Border.Top.Style    = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $cell.Style.Border.Bottom.Style = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $cell.Style.Border.Left.Style   = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $cell.Style.Border.Right.Style  = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
+        $legendCol++
     }
 
-    # Save PNG
+    # -------- Freeze the title + header rows so column scrolling stays oriented
     try {
-        $bmp.Save($OutputImagePath, [System.Drawing.Imaging.ImageFormat]::Png)
-    } finally {
-        $gfx.Dispose()
-        $bmp.Dispose()
-    }
+        $ws.View.FreezePanes(($firstDataRow), ($endCol + 1))
+    } catch { }
+
+    return $ws
 }
 
 # -----------------------------------------------------------------------------
@@ -3288,31 +3368,16 @@ if ($script:ExcelAvailable) {
     # Export-Excel itself doesn't accept a raw image parameter.
     # -------------------------------------------------------------------------
     if ($Report.MITREThreatMap.Count -gt 0) {
-        $graphImagePath = Join-Path -Path $env:TEMP -ChildPath "MITREThreatMapGraph_$Timestamp.png"
         $pkg = $null
         try {
-            # Render the PNG first (outside the package so we don't hold the
-            # workbook open longer than needed).
-            New-MITREThreatMapGraphImage -OutputImagePath $graphImagePath
-
             $pkg = Open-ExcelPackage -Path $ReportFullPath
             try {
                 # ---------------------------------------------------------------
-                # (1) MITRE Threat Map Graph tab - visual heatmap PNG
+                # (1) MITRE Threat Map Graph tab - NATIVE Excel cells
+                #     (was previously a PNG; now real cells so columns/rows are
+                #      user-resizable and text is selectable / copyable)
                 # ---------------------------------------------------------------
-                $existing = $pkg.Workbook.Worksheets | Where-Object { $_.Name -eq 'MITRE Threat Map Graph' }
-                if ($existing) { $pkg.Workbook.Worksheets.Delete('MITRE Threat Map Graph') }
-
-                $graphWs = $pkg.Workbook.Worksheets.Add('MITRE Threat Map Graph')
-                $graphWs.View.ShowGridLines = $false
-
-                $graphWs.Cells['B2'].Value = "MITRE ATT&CK Coverage Heatmap - see 'Executive Summary' and 'MITREThreatMap' tabs for detail"
-                $graphWs.Cells['B2'].Style.Font.Bold = $true
-                $graphWs.Cells['B2'].Style.Font.Size = 14
-
-                $imgFile = [System.IO.FileInfo]$graphImagePath
-                $pic = $graphWs.Drawings.AddPicture('MITREThreatMapGraph', $imgFile)
-                $pic.SetPosition(3, 0, 1, 0)
+                Add-MITREThreatMapGraphSheet -Pkg $pkg | Out-Null
 
                 # ---------------------------------------------------------------
                 # (2) Executive Summary tab - KPIs, charts, vulns, recs
@@ -3359,7 +3424,7 @@ if ($script:ExcelAvailable) {
 
                 Close-ExcelPackage $pkg
                 $pkg = $null
-                Write-Host "    [+] Sheet: MITRE Threat Map Graph (embedded PNG, $([int]((Get-Item $graphImagePath).Length / 1024)) KB)" -ForegroundColor Green
+                Write-Host "    [+] Sheet: MITRE Threat Map Graph (native Excel cells, resizable rows/columns)" -ForegroundColor Green
                 Write-Host "    [+] Sheet: Executive Summary (native Excel charts)" -ForegroundColor Green
                 Write-Host "    [+] Tab order: Graph -> ExecSummary -> MITREThreatMap -> data -> Metadata" -ForegroundColor Green
             } catch {
@@ -3370,10 +3435,6 @@ if ($script:ExcelAvailable) {
         } catch {
             Write-Host "    [!] Graph / Executive Summary build failed: $($_.Exception.Message)" -ForegroundColor Yellow
             Write-Host "        (Raw data tabs and the text MITREThreatMap tab are unaffected.)" -ForegroundColor Yellow
-        } finally {
-            if (Test-Path $graphImagePath) {
-                Remove-Item $graphImagePath -Force -ErrorAction SilentlyContinue
-            }
         }
     }
 } else {
@@ -3435,7 +3496,7 @@ if ($hasFidelityIssues) {
 }
 
 Write-Host "[*] Workbook structure:" -ForegroundColor Cyan
-Write-Host "     Tab  1 : MITRE Threat Map Graph   (visual ATT&CK heatmap)"
+Write-Host "     Tab  1 : MITRE Threat Map Graph   (native-cell ATT&CK heatmap; columns/rows resizable)"
 Write-Host "     Tab  2 : Executive Summary        (KPIs, charts, top findings, recommendations)"
 Write-Host "     Tab  3 : MITREThreatMap           ($($Report.MITREThreatMap.Count) technique rows)"
 Write-Host "     Tabs 4+: Raw enumeration sheets   (Users, SPNs, RBAC, NSGs, KVs, etc.)"
